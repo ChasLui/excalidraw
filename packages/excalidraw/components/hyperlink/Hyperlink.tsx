@@ -41,8 +41,8 @@ import { getTooltipDiv, updateTooltipPosition } from "../../components/Tooltip";
 
 import { t } from "../../i18n";
 
-import { useAppProps, useDevice, useExcalidrawAppState } from "../App";
-import { ToolButton } from "../ToolButton";
+import { useAppProps, useEditorInterface, useExcalidrawAppState } from "../App";
+import { IconButton } from "../IconButton";
 import { FreedrawIcon, TrashIcon, elementLinkIcon } from "../icons";
 import { getSelectedElements } from "../../scene";
 
@@ -88,7 +88,7 @@ export const Hyperlink = ({
   const elementsMap = scene.getNonDeletedElementsMap();
   const appState = useExcalidrawAppState();
   const appProps = useAppProps();
-  const device = useDevice();
+  const editorInterface = useEditorInterface();
 
   const linkVal = element.link || "";
 
@@ -189,11 +189,11 @@ export const Hyperlink = ({
     if (
       isEditing &&
       inputRef?.current &&
-      !(device.viewport.isMobile || device.isTouchScreen)
+      !(editorInterface.formFactor === "phone" || editorInterface.isTouchScreen)
     ) {
       inputRef.current.select();
     }
-  }, [isEditing, device.viewport.isMobile, device.isTouchScreen]);
+  }, [isEditing, editorInterface.formFactor, editorInterface.isTouchScreen]);
 
   useEffect(() => {
     let timeoutId: number | null = null;
@@ -312,7 +312,7 @@ export const Hyperlink = ({
       )}
       <div className="excalidraw-hyperlinkContainer__buttons">
         {!isEditing && (
-          <ToolButton
+          <IconButton
             type="button"
             title={t("buttons.edit")}
             aria-label={t("buttons.edit")}
@@ -322,7 +322,7 @@ export const Hyperlink = ({
             icon={FreedrawIcon}
           />
         )}
-        <ToolButton
+        <IconButton
           type="button"
           title={t("labels.linkToElement")}
           aria-label={t("labels.linkToElement")}
@@ -338,7 +338,7 @@ export const Hyperlink = ({
           icon={elementLinkIcon}
         />
         {linkVal && !isEmbeddableElement(element) && (
-          <ToolButton
+          <IconButton
             type="button"
             title={t("buttons.remove")}
             aria-label={t("buttons.remove")}

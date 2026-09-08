@@ -1,4 +1,10 @@
-import { FRAME_STYLE, throttleRAF } from "@excalidraw/common";
+import {
+  applyDarkModeFilter,
+  COLOR_WHITE,
+  FRAME_STYLE,
+  THEME,
+  throttleRAF,
+} from "@excalidraw/common";
 import { isElementLink } from "@excalidraw/element";
 import { createPlaceholderEmbeddableLabel } from "@excalidraw/element";
 import { getBoundTextElement } from "@excalidraw/element";
@@ -38,8 +44,14 @@ import type {
 import type { StaticCanvasAppState, Zoom } from "../types";
 
 const GridLineColor = {
-  Bold: "#dddddd",
-  Regular: "#e5e5e5",
+  [THEME.LIGHT]: {
+    bold: "#dddddd",
+    regular: "#e5e5e5",
+  },
+  [THEME.DARK]: {
+    bold: applyDarkModeFilter("#dddddd"),
+    regular: applyDarkModeFilter("#e5e5e5"),
+  },
 } as const;
 
 const strokeGrid = (
@@ -51,6 +63,7 @@ const strokeGrid = (
   scrollX: number,
   scrollY: number,
   zoom: Zoom,
+  theme: StaticCanvasRenderConfig["theme"],
   width: number,
   height: number,
 ) => {
@@ -86,7 +99,9 @@ const strokeGrid = (
 
     context.beginPath();
     context.setLineDash(isBold ? [] : lineDash);
-    context.strokeStyle = isBold ? GridLineColor.Bold : GridLineColor.Regular;
+    context.strokeStyle = isBold
+      ? GridLineColor[theme].bold
+      : GridLineColor[theme].regular;
     context.moveTo(x, offsetY - gridSize);
     context.lineTo(x, Math.ceil(offsetY + height + gridSize * 2));
     context.stroke();
@@ -105,7 +120,9 @@ const strokeGrid = (
 
     context.beginPath();
     context.setLineDash(isBold ? [] : lineDash);
-    context.strokeStyle = isBold ? GridLineColor.Bold : GridLineColor.Regular;
+    context.strokeStyle = isBold
+      ? GridLineColor[theme].bold
+      : GridLineColor[theme].regular;
     context.moveTo(offsetX - gridSize, y);
     context.lineTo(Math.ceil(offsetX + width + gridSize * 2), y);
     context.stroke();
@@ -113,7 +130,7 @@ const strokeGrid = (
   context.restore();
 };
 
-const frameClip = (
+export const frameClip = (
   frame: ExcalidrawFrameLikeElement,
   context: CanvasRenderingContext2D,
   renderConfig: StaticCanvasRenderConfig,
@@ -188,7 +205,13 @@ const renderLinkIcon = (
         window.devicePixelRatio * appState.zoom.value,
         window.devicePixelRatio * appState.zoom.value,
       );
-      linkCanvasCacheContext.fillStyle = appState.viewBackgroundColor || "#fff";
+
+      // Seed a sane default so a corrupted color (silently rejected by the
+      // canvas) falls back to white instead of a stale fillStyle.
+      linkCanvasCacheContext.fillStyle = COLOR_WHITE;
+      linkCanvasCacheContext.fillStyle =
+        appState.viewBackgroundColor || COLOR_WHITE;
+
       linkCanvasCacheContext.fillRect(0, 0, width, height);
 
       if (canvasKey === "elementLink") {
@@ -205,6 +228,7 @@ const renderLinkIcon = (
 
       linkCanvasCacheContext.restore();
     }
+    context.globalAlpha = element.opacity / 100;
     context.drawImage(linkCanvas, x - centerX, y - centerY, width, height);
     context.restore();
   }
@@ -252,6 +276,7 @@ const _renderStaticScene = ({
       appState.scrollX,
       appState.scrollY,
       appState.zoom,
+      renderConfig.theme,
       normalizedWidth / appState.zoom.value,
       normalizedHeight / appState.zoom.value,
     );
@@ -351,7 +376,7 @@ const _renderStaticScene = ({
 
         context.restore();
 
-        if (!isExporting) {
+        if (!isExporting && renderConfig.renderLinks !== false) {
           renderLinkIcon(element, context, appState, elementsMap);
         }
       } catch (error: any) {
@@ -402,7 +427,7 @@ const _renderStaticScene = ({
               appState,
             );
           }
-          if (!isExporting) {
+          if (!isExporting && renderConfig.renderLinks !== false) {
             renderLinkIcon(element, context, appState, elementsMap);
           }
         };
@@ -465,7 +490,6 @@ export const renderStaticSceneThrottled = throttleRAF(
   (config: StaticSceneRenderConfig) => {
     _renderStaticScene(config);
   },
-  { trailing: true },
 );
 
 /**

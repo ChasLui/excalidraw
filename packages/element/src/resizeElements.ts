@@ -20,7 +20,11 @@ import type { PointerDownState } from "@excalidraw/excalidraw/types";
 
 import type { Mutable } from "@excalidraw/common/utility-types";
 
-import { getArrowLocalFixedPoints, updateBoundElements } from "./binding";
+import {
+  getArrowLocalFixedPoints,
+  unbindBindingElement,
+  updateBoundElements,
+} from "./binding";
 import {
   getElementAbsoluteCoords,
   getCommonBounds,
@@ -35,6 +39,7 @@ import {
   getContainerElement,
   handleBindTextResize,
   getBoundTextMaxWidth,
+  computeBoundTextPosition,
 } from "./textElement";
 import {
   getMinTextElementWidth,
@@ -45,6 +50,7 @@ import {
 import { wrapText } from "./textWrapping";
 import {
   isArrowElement,
+  isBindingElement,
   isBoundToContainer,
   isElbowArrow,
   isFrameLikeElement,
@@ -73,7 +79,9 @@ import type {
   ExcalidrawImageElement,
   ElementsMap,
   ExcalidrawElbowArrowElement,
+  ExcalidrawArrowElement,
 } from "./types";
+import type { ElementUpdate } from "./mutateElement";
 
 // Returns true when transform (resizing/rotation) happened
 export const transformElements = (
@@ -219,13 +227,40 @@ const rotateSingleElement = (
   }
   const boundTextElementId = getBoundTextElementId(element);
 
-  scene.mutateElement(element, { angle });
+  let update: ElementUpdate<NonDeletedExcalidrawElement> = {
+    angle,
+  };
+
+  if (isBindingElement(element)) {
+    update = {
+      ...update,
+    } as ElementUpdate<NonDeletedExcalidrawElement>;
+
+    if (element.startBinding) {
+      unbindBindingElement(element, "start", scene);
+    }
+    if (element.endBinding) {
+      unbindBindingElement(element, "end", scene);
+    }
+  }
+
+  scene.mutateElement(element, update);
+
   if (boundTextElementId) {
     const textElement =
       scene.getElement<ExcalidrawTextElementWithContainer>(boundTextElementId);
 
     if (textElement && !isArrowElement(element)) {
-      scene.mutateElement(textElement, { angle });
+      const { x, y } = computeBoundTextPosition(
+        element,
+        textElement,
+        scene.getNonDeletedElementsMap(),
+      );
+      scene.mutateElement(textElement, {
+        angle,
+        x,
+        y,
+      });
     }
   }
 };
@@ -353,7 +388,7 @@ export const resizeSingleTextElement = (
       shouldResizeFromCenter,
     );
 
-    const resizedElement: Partial<ExcalidrawTextElement> = {
+    const resizedElement: Partial<NonDeleted<ExcalidrawTextElement>> = {
       width: Math.abs(newWidth),
       height: Math.abs(metrics.height),
       x: newOrigin.x,
@@ -383,6 +418,11 @@ const rotateMultipleElements = (
     centerAngle += SHIFT_LOCKING_ANGLE / 2;
     centerAngle -= centerAngle % SHIFT_LOCKING_ANGLE;
   }
+
+  const rotatedElementsMap = new Map<
+    ExcalidrawElement["id"],
+    NonDeletedExcalidrawElement
+  >(elements.map((element) => [element.id, element]));
 
   for (const element of elements) {
     if (!isFrameLikeElement(element)) {
@@ -414,11 +454,30 @@ const rotateMultipleElements = (
         simultaneouslyUpdated: elements,
       });
 
+      if (isBindingElement(element)) {
+        if (element.startBinding) {
+          if (!rotatedElementsMap.has(element.startBinding.elementId)) {
+            unbindBindingElement(element, "start", scene);
+          }
+        }
+        if (element.endBinding) {
+          if (!rotatedElementsMap.has(element.endBinding.elementId)) {
+            unbindBindingElement(element, "end", scene);
+          }
+        }
+      }
+
       const boundText = getBoundTextElement(element, elementsMap);
       if (boundText && !isArrowElement(element)) {
+        const { x, y } = computeBoundTextPosition(
+          element,
+          boundText,
+          elementsMap,
+        );
+
         scene.mutateElement(boundText, {
-          x: boundText.x + (rotatedCX - cx),
-          y: boundText.y + (rotatedCY - cy),
+          x,
+          y,
           angle: normalizeRadians((centerAngle + origAngle) as Radians),
         });
       }
@@ -663,8 +722,8 @@ const getResizedOrigin = (
 export const resizeSingleElement = (
   nextWidth: number,
   nextHeight: number,
-  latestElement: ExcalidrawElement,
-  origElement: ExcalidrawElement,
+  latestElement: NonDeletedExcalidrawElement,
+  origElement: NonDeletedExcalidrawElement,
   originalElementsMap: ElementsMap,
   scene: Scene,
   handleDirection: TransformHandleDirection,
@@ -819,12 +878,31 @@ export const resizeSingleElement = (
     Number.isFinite(newOrigin.x) &&
     Number.isFinite(newOrigin.y)
   ) {
-    const updates = {
+    let updates: ElementUpdate<ExcalidrawElement> = {
       ...newOrigin,
       width: Math.abs(nextWidth),
       height: Math.abs(nextHeight),
       ...rescaledPoints,
     };
+
+    if (isBindingElement(latestElement)) {
+      if (latestElement.startBinding) {
+        updates = {
+          ...updates,
+        } as ElementUpdate<ExcalidrawArrowElement>;
+
+        if (latestElement.startBinding) {
+          unbindBindingElement(latestElement, "start", scene);
+        }
+      }
+
+      if (latestElement.endBinding) {
+        updates = {
+          ...updates,
+          endBinding: null,
+        } as ElementUpdate<ExcalidrawArrowElement>;
+      }
+    }
 
     scene.mutateElement(latestElement, updates, {
       informMutation: shouldInformMutation,
@@ -841,12 +919,10 @@ export const resizeSingleElement = (
       scene,
       handleDirection,
       shouldMaintainAspectRatio,
+      shouldResizeFromCenter,
     );
 
-    updateBoundElements(latestElement, scene, {
-      // TODO: confirm with MARK if this actually makes sense
-      newSize: { width: nextWidth, height: nextHeight },
-    });
+    updateBoundElements(latestElement, scene);
   }
 };
 
@@ -1125,7 +1201,10 @@ export const resizeMultipleElements = (
       }[],
       element,
     ) => {
-      const origElement = originalElementsMap!.get(element.id);
+      // originalElementsMap holds snapshots of the (non-deleted) selection
+      const origElement = originalElementsMap!.get(element.id) as
+        | NonDeletedExcalidrawElement
+        | undefined;
       if (origElement) {
         acc.push({ orig: origElement, latest: element });
       }
@@ -1164,9 +1243,10 @@ export const resizeMultipleElements = (
       ];
     }, [] as ExcalidrawTextElementWithContainer[]);
 
-    boundingBox = getCommonBoundingBox(
-      targetElements.map(({ orig }) => orig).concat(boundTextElements),
-    );
+    boundingBox = getCommonBoundingBox([
+      ...targetElements.map(({ orig }) => orig),
+      ...boundTextElements,
+    ]);
   }
   const { minX, minY, maxX, maxY, midX, midY } = boundingBox;
   const width = maxX - minX;
@@ -1380,19 +1460,35 @@ export const resizeMultipleElements = (
     }
 
     const elementsToUpdate = elementsAndUpdates.map(({ element }) => element);
+    const resizedElementsMap = new Map<
+      ExcalidrawElement["id"],
+      NonDeletedExcalidrawElement
+    >(elementsAndUpdates.map(({ element }) => [element.id, element]));
 
     for (const {
       element,
       update: { boundTextFontSize, ...update },
     } of elementsAndUpdates) {
-      const { width, height, angle } = update;
+      const { angle } = update;
 
       scene.mutateElement(element, update);
 
       updateBoundElements(element, scene, {
         simultaneouslyUpdated: elementsToUpdate,
-        newSize: { width, height },
       });
+
+      if (isBindingElement(element)) {
+        if (element.startBinding) {
+          if (!resizedElementsMap.has(element.startBinding.elementId)) {
+            unbindBindingElement(element, "start", scene);
+          }
+        }
+        if (element.endBinding) {
+          if (!resizedElementsMap.has(element.endBinding.elementId)) {
+            unbindBindingElement(element, "end", scene);
+          }
+        }
+      }
 
       const boundTextElement = getBoundTextElement(element, elementsMap);
       if (boundTextElement && boundTextFontSize) {
@@ -1400,7 +1496,13 @@ export const resizeMultipleElements = (
           fontSize: boundTextFontSize,
           angle: isLinearElement(element) ? undefined : angle,
         });
-        handleBindTextResize(element, scene, handleDirection, true);
+        handleBindTextResize(
+          element,
+          scene,
+          handleDirection,
+          true,
+          shouldResizeFromCenter,
+        );
       }
     }
 

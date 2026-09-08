@@ -1,4 +1,4 @@
-import { isTransparent } from "@excalidraw/common";
+import { invariant, isTransparent, type Bounds } from "@excalidraw/common";
 import {
   curveIntersectLineSegment,
   isPointWithinBounds,
@@ -11,7 +11,6 @@ import {
   vectorFromPoint,
   vectorNormalize,
   vectorScale,
-  doBoundsIntersect,
 } from "@excalidraw/math";
 
 import {
@@ -19,19 +18,29 @@ import {
   ellipseSegmentInterceptPoints,
 } from "@excalidraw/math/ellipse";
 
-import type { GlobalPoint, LineSegment, Radians } from "@excalidraw/math";
+import type {
+  Curve,
+  GlobalPoint,
+  LineSegment,
+  Radians,
+} from "@excalidraw/math";
 
 import type { FrameNameBounds } from "@excalidraw/excalidraw/types";
 
 import { isPathALoop } from "./utils";
 import {
-  type Bounds,
+  doBoundsIntersect,
   elementCenterPoint,
   getCenterForBounds,
+  getCubicBezierCurveBound,
+  getDiamondPoints,
   getElementBounds,
+  pointInsideBounds,
 } from "./bounds";
 import {
   hasBoundTextElement,
+  isBindableElement,
+  isFrameLikeElement,
   isFreeDrawElement,
   isIframeLikeElement,
   isImageElement,
@@ -50,14 +59,24 @@ import { LinearElementEditor } from "./linearElementEditor";
 
 import { distanceToElement } from "./distance";
 
+import { getBindingGap } from "./binding";
+
+import { hasBackground } from "./comparisons";
+
 import type {
   ElementsMap,
+  ExcalidrawArrowElement,
+  ExcalidrawBindableElement,
   ExcalidrawDiamondElement,
   ExcalidrawElement,
   ExcalidrawEllipseElement,
   ExcalidrawFreeDrawElement,
   ExcalidrawLinearElement,
   ExcalidrawRectanguloidElement,
+  NonDeleted,
+  NonDeletedExcalidrawElement,
+  NonDeletedSceneElementsMap,
+  Ordered,
 } from "./types";
 
 export const shouldTestInside = (element: ExcalidrawElement) => {
@@ -66,7 +85,7 @@ export const shouldTestInside = (element: ExcalidrawElement) => {
   }
 
   const isDraggableFromInside =
-    !isTransparent(element.backgroundColor) ||
+    (hasBackground(element.type) && !isTransparent(element.backgroundColor)) ||
     hasBoundTextElement(element) ||
     isIframeLikeElement(element) ||
     isTextElement(element);
@@ -88,7 +107,27 @@ export type HitTestArgs = {
   threshold: number;
   elementsMap: ElementsMap;
   frameNameBound?: FrameNameBounds | null;
+  overrideShouldTestInside?: boolean;
 };
+
+let cachedPoint: GlobalPoint | null = null;
+let cachedElement: WeakRef<ExcalidrawElement> | null = null;
+let cachedThreshold: number = Infinity;
+let cachedHit: boolean = false;
+let cachedOverrideShouldTestInside = false;
+let cachedFrameNameBound: FrameNameBounds | null = null;
+
+const frameNameBoundsEqual = (
+  a: FrameNameBounds | null,
+  b: FrameNameBounds | null,
+) =>
+  a === b ||
+  (!!a &&
+    !!b &&
+    a.x === b.x &&
+    a.y === b.y &&
+    a.width === b.width &&
+    a.height === b.height);
 
 export const hitElementItself = ({
   point,
@@ -96,7 +135,30 @@ export const hitElementItself = ({
   threshold,
   elementsMap,
   frameNameBound = null,
+  overrideShouldTestInside = false,
 }: HitTestArgs) => {
+  // Return cached result if the same point and element version is tested again.
+  // A cached hit stays valid for any larger threshold, while a cached miss
+  // stays valid only for a threshold no larger than the cached one (a larger
+  // threshold could turn a miss into a hit).
+  if (
+    cachedPoint &&
+    pointsEqual(point, cachedPoint) &&
+    (cachedHit ? cachedThreshold <= threshold : cachedThreshold >= threshold) &&
+    overrideShouldTestInside === cachedOverrideShouldTestInside &&
+    frameNameBoundsEqual(frameNameBound, cachedFrameNameBound)
+  ) {
+    const derefElement = cachedElement?.deref();
+    if (
+      derefElement &&
+      derefElement.id === element.id &&
+      derefElement.version === element.version &&
+      derefElement.versionNonce === element.versionNonce
+    ) {
+      return cachedHit;
+    }
+  }
+
   // Hit test against a frame's name
   const hitFrameName = frameNameBound
     ? isPointWithinBounds(
@@ -111,14 +173,11 @@ export const hitElementItself = ({
 
   // Hit test against the extended, rotated bounding box of the element first
   const bounds = getElementBounds(element, elementsMap, true);
-  const hitBounds = isPointWithinBounds(
-    pointFrom(bounds[0] - threshold, bounds[1] - threshold),
-    pointRotateRads(
-      point,
-      getCenterForBounds(bounds),
-      -element.angle as Radians,
-    ),
-    pointFrom(bounds[2] + threshold, bounds[3] + threshold),
+  const hitBounds = isPointInRotatedBounds(
+    point,
+    bounds,
+    element.angle,
+    threshold,
   );
 
   // PERF: Bail out early if the point is not even in the
@@ -128,14 +187,44 @@ export const hitElementItself = ({
   }
 
   // Do the precise (and relatively costly) hit test
-  const hitElement = shouldTestInside(element)
+  const hitElement = (
+    overrideShouldTestInside ? true : shouldTestInside(element)
+  )
     ? // Since `inShape` tests STRICTLY againt the insides of a shape
       // we would need `onShape` as well to include the "borders"
       isPointInElement(point, element, elementsMap) ||
       isPointOnElementOutline(point, element, elementsMap, threshold)
     : isPointOnElementOutline(point, element, elementsMap, threshold);
 
-  return hitElement || hitFrameName;
+  const result = hitElement || hitFrameName;
+
+  // Cache end result
+  cachedPoint = point;
+  cachedElement = new WeakRef(element);
+  cachedThreshold = threshold;
+  cachedOverrideShouldTestInside = overrideShouldTestInside;
+  cachedFrameNameBound = frameNameBound;
+  cachedHit = result;
+
+  return result;
+};
+
+const isPointInRotatedBounds = (
+  point: GlobalPoint,
+  bounds: Bounds,
+  angle: Radians,
+  tolerance = 0,
+) => {
+  const adjustedPoint =
+    angle === 0
+      ? point
+      : pointRotateRads(point, getCenterForBounds(bounds), -angle as Radians);
+
+  return isPointWithinBounds(
+    pointFrom(bounds[0] - tolerance, bounds[1] - tolerance),
+    adjustedPoint,
+    pointFrom(bounds[2] + tolerance, bounds[3] + tolerance),
+  );
 };
 
 export const hitElementBoundingBox = (
@@ -144,12 +233,8 @@ export const hitElementBoundingBox = (
   elementsMap: ElementsMap,
   tolerance = 0,
 ) => {
-  let [x1, y1, x2, y2] = getElementBounds(element, elementsMap);
-  x1 -= tolerance;
-  y1 -= tolerance;
-  x2 += tolerance;
-  y2 += tolerance;
-  return isPointWithinBounds(pointFrom(x1, y1), point, pointFrom(x2, y2));
+  const bounds = getElementBounds(element, elementsMap, true);
+  return isPointInRotatedBounds(point, bounds, element.angle, tolerance);
 };
 
 export const hitElementBoundingBoxOnly = (
@@ -185,6 +270,169 @@ export const hitElementBoundText = (
     : boundTextElementCandidate;
 
   return isPointInElement(point, boundTextElement, elementsMap);
+};
+
+const bindingBorderTest = (
+  element: NonDeleted<ExcalidrawBindableElement>,
+  [x, y]: Readonly<GlobalPoint>,
+  elementsMap: NonDeletedSceneElementsMap,
+  tolerance: number = 0,
+): boolean => {
+  const p = pointFrom<GlobalPoint>(x, y);
+  const shouldTestInside =
+    // disable fullshape snapping for frame elements so we
+    // can bind to frame children
+    !isFrameLikeElement(element);
+
+  // PERF: Run a cheap test to see if the binding element
+  // is even close to the element
+  const t = Math.max(1, tolerance);
+  const bounds = [x - t, y - t, x + t, y + t] as Bounds;
+  const elementBounds = getElementBounds(element, elementsMap);
+  if (!doBoundsIntersect(bounds, elementBounds)) {
+    return false;
+  }
+
+  // If the element is inside a frame, we should clip the element
+  if (element.frameId) {
+    const enclosingFrame = elementsMap.get(element.frameId);
+    if (enclosingFrame && isFrameLikeElement(enclosingFrame)) {
+      const enclosingFrameBounds = getElementBounds(
+        enclosingFrame,
+        elementsMap,
+      );
+      if (!pointInsideBounds(p, enclosingFrameBounds)) {
+        return false;
+      }
+    }
+  }
+
+  // Do the intersection test against the element since it's close enough
+  const intersections = intersectElementWithLineSegment(
+    element,
+    elementsMap,
+    lineSegment(elementCenterPoint(element, elementsMap), p),
+  );
+  const distance = distanceToElement(element, elementsMap, p);
+
+  return shouldTestInside
+    ? intersections.length === 0 || distance <= tolerance
+    : intersections.length > 0 && distance <= t;
+};
+
+export const getAllHoveredElementAtPoint = (
+  point: Readonly<GlobalPoint>,
+  elements: readonly Ordered<NonDeletedExcalidrawElement>[],
+  elementsMap: NonDeletedSceneElementsMap,
+  tolerance?: number,
+): NonDeleted<ExcalidrawBindableElement>[] => {
+  const candidateElements: NonDeleted<ExcalidrawBindableElement>[] = [];
+  // We need to to hit testing from front (end of the array) to back (beginning of the array)
+  // because array is ordered from lower z-index to highest and we want element z-index
+  // with higher z-index
+  for (let index = elements.length - 1; index >= 0; --index) {
+    const element = elements[index];
+
+    invariant(
+      !element.isDeleted,
+      "Elements in the function parameter for getAllElementsAtPositionForBinding() should not contain deleted elements",
+    );
+
+    if (
+      isBindableElement(element, false) &&
+      bindingBorderTest(element, point, elementsMap, tolerance)
+    ) {
+      candidateElements.push(element);
+
+      if (
+        hasBackground(element.type) &&
+        !isTransparent(element.backgroundColor)
+      ) {
+        break;
+      }
+    }
+  }
+
+  return candidateElements;
+};
+
+export const getHoveredElementForBinding = (
+  point: Readonly<GlobalPoint>,
+  elements: readonly Ordered<NonDeletedExcalidrawElement>[],
+  elementsMap: NonDeletedSceneElementsMap,
+  tolerance?: number,
+): NonDeleted<ExcalidrawBindableElement> | null => {
+  const candidateElements = getAllHoveredElementAtPoint(
+    point,
+    elements,
+    elementsMap,
+    tolerance,
+  );
+
+  if (!candidateElements || candidateElements.length === 0) {
+    return null;
+  }
+
+  if (candidateElements.length === 1) {
+    return candidateElements[0];
+  }
+
+  // Prefer smaller shapes
+  return candidateElements
+    .sort(
+      (a, b) => b.width ** 2 + b.height ** 2 - (a.width ** 2 + a.height ** 2),
+    )
+    .pop() as NonDeleted<ExcalidrawBindableElement>;
+};
+
+export const getHoveredElementForFocusPoint = (
+  point: GlobalPoint,
+  arrow: ExcalidrawArrowElement,
+  elements: readonly Ordered<NonDeletedExcalidrawElement>[],
+  elementsMap: NonDeletedSceneElementsMap,
+  tolerance?: number,
+): NonDeleted<ExcalidrawBindableElement> | null => {
+  const candidateElements: NonDeleted<ExcalidrawBindableElement>[] = [];
+  // We need to to hit testing from front (end of the array) to back (beginning of the array)
+  // because array is ordered from lower z-index to highest and we want element z-index
+  // with higher z-index
+  for (let index = elements.length - 1; index >= 0; --index) {
+    const element = elements[index];
+
+    invariant(
+      !element.isDeleted,
+      "Elements in the function parameter for getAllElementsAtPositionForBinding() should not contain deleted elements",
+    );
+
+    if (
+      isBindableElement(element, false) &&
+      bindingBorderTest(element, point, elementsMap, tolerance)
+    ) {
+      candidateElements.push(element);
+    }
+  }
+
+  if (!candidateElements || candidateElements.length === 0) {
+    return null;
+  }
+
+  if (candidateElements.length === 1) {
+    return candidateElements[0];
+  }
+
+  const distanceFilteredCandidateElements = candidateElements
+    // Resolve by distance
+    .filter(
+      (el) =>
+        distanceToElement(el, elementsMap, point) <= getBindingGap(el, arrow) ||
+        isPointInElement(point, el, elementsMap),
+    );
+
+  if (distanceFilteredCandidateElements.length === 0) {
+    return null;
+  }
+
+  return distanceFilteredCandidateElements[0] as NonDeleted<ExcalidrawBindableElement>;
 };
 
 /**
@@ -251,17 +499,88 @@ export const intersectElementWithLineSegment = (
     case "line":
     case "freedraw":
     case "arrow":
-      return intersectLinearOrFreeDrawWithLineSegment(element, line, onlyFirst);
+      return intersectLinearOrFreeDrawWithLineSegment(
+        element,
+        line,
+        elementsMap,
+        onlyFirst,
+      );
   }
+};
+
+const curveIntersections = (
+  curves: Curve<GlobalPoint>[],
+  segment: LineSegment<GlobalPoint>,
+  intersections: GlobalPoint[],
+  center: GlobalPoint,
+  angle: Radians,
+  onlyFirst = false,
+) => {
+  for (const c of curves) {
+    // Optimize by doing a cheap bounding box check first
+    const b1 = getCubicBezierCurveBound(c[0], c[1], c[2], c[3]);
+    const b2 = [
+      Math.min(segment[0][0], segment[1][0]),
+      Math.min(segment[0][1], segment[1][1]),
+      Math.max(segment[0][0], segment[1][0]),
+      Math.max(segment[0][1], segment[1][1]),
+    ] as Bounds;
+
+    if (!doBoundsIntersect(b1, b2)) {
+      continue;
+    }
+
+    const hits = curveIntersectLineSegment(c, segment);
+
+    if (hits.length > 0) {
+      for (const j of hits) {
+        intersections.push(pointRotateRads(j, center, angle));
+      }
+
+      if (onlyFirst) {
+        return intersections;
+      }
+    }
+  }
+
+  return intersections;
+};
+
+const lineIntersections = (
+  lines: LineSegment<GlobalPoint>[],
+  segment: LineSegment<GlobalPoint>,
+  intersections: GlobalPoint[],
+  center: GlobalPoint,
+  angle: Radians,
+  onlyFirst = false,
+) => {
+  for (const l of lines) {
+    const intersection = lineSegmentIntersectionPoints(l, segment);
+    if (intersection) {
+      intersections.push(pointRotateRads(intersection, center, angle));
+
+      if (onlyFirst) {
+        return intersections;
+      }
+    }
+  }
+
+  return intersections;
 };
 
 const intersectLinearOrFreeDrawWithLineSegment = (
   element: ExcalidrawLinearElement | ExcalidrawFreeDrawElement,
   segment: LineSegment<GlobalPoint>,
+  elementsMap: ElementsMap,
   onlyFirst = false,
 ): GlobalPoint[] => {
-  const [lines, curves] = deconstructLinearOrFreeDrawElement(element);
-  const intersections = [];
+  // NOTE: This is the only one which return the decomposed elements
+  // rotated! This is due to taking advantage of roughjs definitions.
+  const [lines, curves] = deconstructLinearOrFreeDrawElement(
+    element,
+    elementsMap,
+  );
+  const intersections: GlobalPoint[] = [];
 
   for (const l of lines) {
     const intersection = lineSegmentIntersectionPoints(l, segment);
@@ -275,7 +594,22 @@ const intersectLinearOrFreeDrawWithLineSegment = (
   }
 
   for (const c of curves) {
-    const hits = curveIntersectLineSegment(c, segment);
+    // Optimize by doing a cheap bounding box check first
+    const b1 = getCubicBezierCurveBound(c[0], c[1], c[2], c[3]);
+    const b2 = [
+      Math.min(segment[0][0], segment[1][0]),
+      Math.min(segment[0][1], segment[1][1]),
+      Math.max(segment[0][0], segment[1][0]),
+      Math.max(segment[0][1], segment[1][1]),
+    ] as Bounds;
+
+    if (!doBoundsIntersect(b1, b2)) {
+      continue;
+    }
+
+    const hits = curveIntersectLineSegment(c, segment, {
+      iterLimit: 10,
+    });
 
     if (hits.length > 0) {
       intersections.push(...hits);
@@ -292,7 +626,7 @@ const intersectLinearOrFreeDrawWithLineSegment = (
 const intersectRectanguloidWithLineSegment = (
   element: ExcalidrawRectanguloidElement,
   elementsMap: ElementsMap,
-  l: LineSegment<GlobalPoint>,
+  segment: LineSegment<GlobalPoint>,
   offset: number = 0,
   onlyFirst = false,
 ): GlobalPoint[] => {
@@ -300,48 +634,43 @@ const intersectRectanguloidWithLineSegment = (
   // To emulate a rotated rectangle we rotate the point in the inverse angle
   // instead. It's all the same distance-wise.
   const rotatedA = pointRotateRads<GlobalPoint>(
-    l[0],
+    segment[0],
     center,
     -element.angle as Radians,
   );
   const rotatedB = pointRotateRads<GlobalPoint>(
-    l[1],
+    segment[1],
     center,
     -element.angle as Radians,
   );
+  const rotatedIntersector = lineSegment(rotatedA, rotatedB);
 
   // Get the element's building components we can test against
   const [sides, corners] = deconstructRectanguloidElement(element, offset);
 
   const intersections: GlobalPoint[] = [];
 
-  for (const s of sides) {
-    const intersection = lineSegmentIntersectionPoints(
-      lineSegment(rotatedA, rotatedB),
-      s,
-    );
-    if (intersection) {
-      intersections.push(pointRotateRads(intersection, center, element.angle));
+  lineIntersections(
+    sides,
+    rotatedIntersector,
+    intersections,
+    center,
+    element.angle,
+    onlyFirst,
+  );
 
-      if (onlyFirst) {
-        return intersections;
-      }
-    }
+  if (onlyFirst && intersections.length > 0) {
+    return intersections;
   }
 
-  for (const t of corners) {
-    const hits = curveIntersectLineSegment(t, lineSegment(rotatedA, rotatedB));
-
-    if (hits.length > 0) {
-      for (const j of hits) {
-        intersections.push(pointRotateRads(j, center, element.angle));
-      }
-
-      if (onlyFirst) {
-        return intersections;
-      }
-    }
-  }
+  curveIntersections(
+    corners,
+    rotatedIntersector,
+    intersections,
+    center,
+    element.angle,
+    onlyFirst,
+  );
 
   return intersections;
 };
@@ -366,38 +695,32 @@ const intersectDiamondWithLineSegment = (
   // points. It's all the same distance-wise.
   const rotatedA = pointRotateRads(l[0], center, -element.angle as Radians);
   const rotatedB = pointRotateRads(l[1], center, -element.angle as Radians);
+  const rotatedIntersector = lineSegment(rotatedA, rotatedB);
 
   const [sides, corners] = deconstructDiamondElement(element, offset);
-
   const intersections: GlobalPoint[] = [];
 
-  for (const s of sides) {
-    const intersection = lineSegmentIntersectionPoints(
-      lineSegment(rotatedA, rotatedB),
-      s,
-    );
-    if (intersection) {
-      intersections.push(pointRotateRads(intersection, center, element.angle));
+  lineIntersections(
+    sides,
+    rotatedIntersector,
+    intersections,
+    center,
+    element.angle,
+    onlyFirst,
+  );
 
-      if (onlyFirst) {
-        return intersections;
-      }
-    }
+  if (onlyFirst && intersections.length > 0) {
+    return intersections;
   }
 
-  for (const t of corners) {
-    const hits = curveIntersectLineSegment(t, lineSegment(rotatedA, rotatedB));
-
-    if (hits.length > 0) {
-      for (const j of hits) {
-        intersections.push(pointRotateRads(j, center, element.angle));
-      }
-
-      if (onlyFirst) {
-        return intersections;
-      }
-    }
-  }
+  curveIntersections(
+    corners,
+    rotatedIntersector,
+    intersections,
+    center,
+    element.angle,
+    onlyFirst,
+  );
 
   return intersections;
 };
@@ -483,4 +806,62 @@ export const isPointInElement = (
   ).filter((p, pos, arr) => arr.findIndex((q) => pointsEqual(q, p)) === pos);
 
   return intersections.length % 2 === 1;
+};
+
+export const isBindableElementInsideOtherBindable = (
+  innerElement: ExcalidrawBindableElement,
+  outerElement: ExcalidrawBindableElement,
+  elementsMap: ElementsMap,
+): boolean => {
+  // Get corner points of the inner element based on its type
+  const getCornerPoints = (
+    element: ExcalidrawElement,
+    offset: number,
+  ): GlobalPoint[] => {
+    const { x, y, width, height, angle } = element;
+    const center = elementCenterPoint(element, elementsMap);
+
+    if (element.type === "diamond") {
+      // Diamond has 4 corner points at the middle of each side
+      const [topX, topY, rightX, rightY, bottomX, bottomY, leftX, leftY] =
+        getDiamondPoints(element);
+      const corners: GlobalPoint[] = [
+        pointFrom(x + topX, y + topY - offset), // top
+        pointFrom(x + rightX + offset, y + rightY), // right
+        pointFrom(x + bottomX, y + bottomY + offset), // bottom
+        pointFrom(x + leftX - offset, y + leftY), // left
+      ];
+      return corners.map((corner) => pointRotateRads(corner, center, angle));
+    }
+    if (element.type === "ellipse") {
+      // For ellipse, test points at the extremes (top, right, bottom, left)
+      const cx = x + width / 2;
+      const cy = y + height / 2;
+      const rx = width / 2;
+      const ry = height / 2;
+      const corners: GlobalPoint[] = [
+        pointFrom(cx, cy - ry - offset), // top
+        pointFrom(cx + rx + offset, cy), // right
+        pointFrom(cx, cy + ry + offset), // bottom
+        pointFrom(cx - rx - offset, cy), // left
+      ];
+      return corners.map((corner) => pointRotateRads(corner, center, angle));
+    }
+    // Rectangle and other rectangular shapes (image, text, etc.)
+    const corners: GlobalPoint[] = [
+      pointFrom(x - offset, y - offset), // top-left
+      pointFrom(x + width + offset, y - offset), // top-right
+      pointFrom(x + width + offset, y + height + offset), // bottom-right
+      pointFrom(x - offset, y + height + offset), // bottom-left
+    ];
+    return corners.map((corner) => pointRotateRads(corner, center, angle));
+  };
+
+  const offset = (-1 * Math.max(innerElement.width, innerElement.height)) / 20; // 5% offset
+  const innerCorners = getCornerPoints(innerElement, offset);
+
+  // Check if all corner points of the inner element are inside the outer element
+  return innerCorners.every((corner) =>
+    isPointInElement(corner, outerElement, elementsMap),
+  );
 };

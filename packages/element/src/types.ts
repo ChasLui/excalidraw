@@ -15,7 +15,7 @@ import type {
   ValueOf,
 } from "@excalidraw/common/utility-types";
 
-export type ChartType = "bar" | "line";
+export type ChartType = "bar" | "line" | "radar";
 export type FillStyle = "hachure" | "cross-hatch" | "solid" | "zigzag";
 export type FontFamilyKeys = keyof typeof FONT_FAMILY;
 export type FontFamilyValues = typeof FONT_FAMILY[FontFamilyKeys];
@@ -76,6 +76,11 @@ type _ExcalidrawElementBase = Readonly<{
   boundElements: readonly BoundElement[] | null;
   /** epoch (ms) timestamp of last element update */
   updated: number;
+  /** Client wall-clock creation time in epoch milliseconds; null if unknown.
+      Preserved for this element's lifetime, including edits and undo/redo,
+      and excluded from `ElementUpdate` (mutateElement / newElementWith).
+      Duplicating an element starts a new lifetime. Not an ordering clock. */
+  created: number | null;
   link: string | null;
   locked: boolean;
   customData?: Record<string, any>;
@@ -227,7 +232,7 @@ export type Ordered<TElement extends ExcalidrawElement> = TElement & {
 export type OrderedExcalidrawElement = Ordered<ExcalidrawElement>;
 
 export type NonDeleted<TElement extends ExcalidrawElement> = TElement & {
-  isDeleted: boolean;
+  isDeleted: false;
 };
 
 export type NonDeletedExcalidrawElement = NonDeleted<ExcalidrawElement>;
@@ -254,6 +259,13 @@ export type ExcalidrawTextElement = _ExcalidrawElementBase &
      *  with font size (using `getLineHeightInPx` helper).
      */
     lineHeight: number & { _brand: "unitlessLineHeight" };
+    /**
+     * Position of text bound to a linear element (such as an arrow),
+     * expressed as a normalized arc-length parameter (0–1) along the
+     * container's whole path. Independent of how the path is segmented,
+     * so it survives midpoint insertion and other geometry changes.
+     * */
+    labelPosition?: number | null;
   }>;
 
 export type ExcalidrawBindableElement =
@@ -279,23 +291,22 @@ export type ExcalidrawTextElementWithContainer = {
 
 export type FixedPoint = [number, number];
 
-export type PointBinding = {
-  elementId: ExcalidrawBindableElement["id"];
-  focus: number;
-  gap: number;
-};
+export type BindMode = "inside" | "orbit" | "skip";
 
-export type FixedPointBinding = Merge<
-  PointBinding,
-  {
-    // Represents the fixed point binding information in form of a vertical and
-    // horizontal ratio (i.e. a percentage value in the 0.0-1.0 range). This ratio
-    // gives the user selected fixed point by multiplying the bound element width
-    // with fixedPoint[0] and the bound element height with fixedPoint[1] to get the
-    // bound element-local point coordinate.
-    fixedPoint: FixedPoint;
-  }
->;
+export type FixedPointBinding = {
+  elementId: ExcalidrawBindableElement["id"];
+
+  // Represents the fixed point binding information in form of a vertical and
+  // horizontal ratio (i.e. a percentage value in the 0.0-1.0 range). This ratio
+  // gives the user selected fixed point by multiplying the bound element width
+  // with fixedPoint[0] and the bound element height with fixedPoint[1] to get the
+  // bound element-local point coordinate.
+  fixedPoint: FixedPoint;
+
+  // Determines whether the arrow remains outside the shape or is allowed to
+  // go all the way inside the shape up to the exact fixed point.
+  mode: BindMode;
+};
 
 type Index = number;
 
@@ -304,27 +315,39 @@ export type PointsPositionUpdates = Map<
   { point: LocalPoint; isDragging?: boolean }
 >;
 
+export type CardinalityArrowhead =
+  | "cardinality_one"
+  | "cardinality_many"
+  | "cardinality_one_or_many"
+  | "cardinality_exactly_one"
+  | "cardinality_zero_or_one"
+  | "cardinality_zero_or_many";
+
+export type ArrowheadLegacy =
+  | "dot"
+  | "crowfoot_one"
+  | "crowfoot_many"
+  | "crowfoot_one_or_many";
+
 export type Arrowhead =
   | "arrow"
   | "bar"
-  | "dot" // legacy. Do not use for new elements.
   | "circle"
   | "circle_outline"
   | "triangle"
   | "triangle_outline"
   | "diamond"
   | "diamond_outline"
-  | "crowfoot_one"
-  | "crowfoot_many"
-  | "crowfoot_one_or_many";
+  | CardinalityArrowhead;
+
+export type AnyArrowhead = Arrowhead | ArrowheadLegacy;
 
 export type ExcalidrawLinearElement = _ExcalidrawElementBase &
   Readonly<{
     type: "line" | "arrow";
     points: readonly LocalPoint[];
-    lastCommittedPoint: LocalPoint | null;
-    startBinding: PointBinding | null;
-    endBinding: PointBinding | null;
+    startBinding: FixedPointBinding | null;
+    endBinding: FixedPointBinding | null;
     startArrowhead: Arrowhead | null;
     endArrowhead: Arrowhead | null;
   }>;
@@ -351,9 +374,9 @@ export type ExcalidrawElbowArrowElement = Merge<
   ExcalidrawArrowElement,
   {
     elbowed: true;
+    fixedSegments: readonly FixedSegment[] | null;
     startBinding: FixedPointBinding | null;
     endBinding: FixedPointBinding | null;
-    fixedSegments: readonly FixedSegment[] | null;
     /**
      * Marks that the 3rd point should be used as the 2nd point of the arrow in
      * order to temporarily hide the first segment of the arrow without losing
@@ -373,13 +396,20 @@ export type ExcalidrawElbowArrowElement = Merge<
   }
 >;
 
+export type StrokeVariability = "variable" | "constant";
+
+export type StrokeOptions = Readonly<{
+  variability: StrokeVariability;
+  streamline: number;
+}>;
+
 export type ExcalidrawFreeDrawElement = _ExcalidrawElementBase &
   Readonly<{
     type: "freedraw";
     points: readonly LocalPoint[];
     pressures: readonly number[];
     simulatePressure: boolean;
-    lastCommittedPoint: LocalPoint | null;
+    strokeOptions: StrokeOptions;
   }>;
 
 export type FileId = string & { _brand: "FileId" };
@@ -426,6 +456,10 @@ export type NonDeletedSceneElementsMap = Map<
 export type ElementsMapOrArray =
   | readonly ExcalidrawElement[]
   | Readonly<ElementsMap>;
+
+export type NonDeletedElementsMapOrArray =
+  | readonly NonDeletedExcalidrawElement[]
+  | Readonly<NonDeletedElementsMap | NonDeletedSceneElementsMap>;
 
 export type ExcalidrawLinearElementSubType =
   | "line"

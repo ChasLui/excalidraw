@@ -1,4 +1,9 @@
-import { isWindows, KEYS, matchKey, arrayToMap } from "@excalidraw/common";
+import {
+  KEYS,
+  matchKey,
+  arrayToMap,
+  MOBILE_ACTION_BUTTON_BG,
+} from "@excalidraw/common";
 
 import { CaptureUpdateAction } from "@excalidraw/element";
 
@@ -6,11 +11,13 @@ import { orderByFractionalIndex } from "@excalidraw/element";
 
 import type { SceneElementsMap } from "@excalidraw/element/types";
 
-import { ToolButton } from "../components/ToolButton";
+import { IconButton } from "../components/IconButton";
 import { UndoIcon, RedoIcon } from "../components/icons";
 import { HistoryChangedEvent } from "../history";
 import { useEmitter } from "../hooks/useEmitter";
 import { t } from "../i18n";
+
+import { useStylesPanelMode } from "../components/App";
 
 import type { History } from "../history";
 import type { AppClassProperties, AppState } from "../types";
@@ -28,7 +35,11 @@ const executeHistoryAction = (
     !appState.newElement &&
     !appState.selectedElementsAreBeingDragged &&
     !appState.selectionElement &&
-    !app.flowChartCreator.isCreatingChart
+    !app.flowchart.isCreatingChart &&
+    // a drawShape sketch in progress isn't visible via `newElement` while
+    // the stroke is still unrecognized — block history mid-gesture the same
+    // way as for the other in-progress interactions above
+    !app.drawShape.hasPendingGesture()
   ) {
     const result = updater();
 
@@ -67,7 +78,7 @@ export const createUndoAction: ActionCreator = (history) => ({
     ),
   keyTest: (event) =>
     event[KEYS.CTRL_OR_CMD] && matchKey(event, KEYS.Z) && !event.shiftKey,
-  PanelComponent: ({ updateData, data }) => {
+  PanelComponent: ({ appState, updateData, data, app }) => {
     const { isUndoStackEmpty } = useEmitter<HistoryChangedEvent>(
       history.onHistoryChangedEmitter,
       new HistoryChangedEvent(
@@ -75,9 +86,10 @@ export const createUndoAction: ActionCreator = (history) => ({
         history.isRedoStackEmpty,
       ),
     );
+    const isMobile = useStylesPanelMode() === "mobile";
 
     return (
-      <ToolButton
+      <IconButton
         type="button"
         icon={UndoIcon}
         aria-label={t("buttons.undo")}
@@ -85,6 +97,9 @@ export const createUndoAction: ActionCreator = (history) => ({
         size={data?.size || "medium"}
         disabled={isUndoStackEmpty}
         data-testid="button-undo"
+        style={{
+          ...(isMobile ? MOBILE_ACTION_BUTTON_BG : {}),
+        }}
       />
     );
   },
@@ -102,8 +117,8 @@ export const createRedoAction: ActionCreator = (history) => ({
     ),
   keyTest: (event) =>
     (event[KEYS.CTRL_OR_CMD] && event.shiftKey && matchKey(event, KEYS.Z)) ||
-    (isWindows && event.ctrlKey && !event.shiftKey && matchKey(event, KEYS.Y)),
-  PanelComponent: ({ updateData, data }) => {
+    (event[KEYS.CTRL_OR_CMD] && !event.shiftKey && matchKey(event, KEYS.Y)),
+  PanelComponent: ({ appState, updateData, data, app }) => {
     const { isRedoStackEmpty } = useEmitter(
       history.onHistoryChangedEmitter,
       new HistoryChangedEvent(
@@ -111,9 +126,10 @@ export const createRedoAction: ActionCreator = (history) => ({
         history.isRedoStackEmpty,
       ),
     );
+    const isMobile = useStylesPanelMode() === "mobile";
 
     return (
-      <ToolButton
+      <IconButton
         type="button"
         icon={RedoIcon}
         aria-label={t("buttons.redo")}
@@ -121,6 +137,9 @@ export const createRedoAction: ActionCreator = (history) => ({
         size={data?.size || "medium"}
         disabled={isRedoStackEmpty}
         data-testid="button-redo"
+        style={{
+          ...(isMobile ? MOBILE_ACTION_BUTTON_BG : {}),
+        }}
       />
     );
   },
